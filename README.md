@@ -283,7 +283,34 @@ wscat -c 127.0.0.1:9944 -x '{"jsonrpc":"2.0", "id":1, "method":"author_submitExt
 
 # You can easily achieve the same with `curl` as well:
 
-curl http://34.79.74.54:9934 -H "Content-Type:application/json;charset=utf-8" -d   '{"jsonrpc":"2.0","id":1,"method":"system_chain"}'
+curl http://localhost:9933 -H "Content-Type:application/json;charset=utf-8" -d   '{"jsonrpc":"2.0","id":1,"method":"author_submitExtrinsic", "params": ["002a000000"] }'
 ```
 
 The easiest way to get the encoded keys is to write a unit test in your runtime that encodes a key/extrinsic.
+
+
+
+CLI App (wallet UX)
+
+[//]: # (- Create flow to create wallet UX)
+
+[//]: # (- Create recovery phrase and random values for entropy)
+- use sp_core:: and sp_io
+- pub fn from_entropy(entropy: &[u8], password: Option<&str>) -> (Pair, [u8; 32]) PubKey & PrivateKey
+- message => Hash(transaction)
+- fn sign(&self, message: &[u8]) -> Self::Signature [https://paritytech.github.io/substrate/master/sp_core/crypto/trait.Pair.html#tymethod.sign]
+- Test encode Transaction into/from bytes using Scale Codec
+
+Runtime
+- Receive JSON-RPC call from Client with encoded hex extrinsic
+- Create struct Transaction { from, to, amount }
+- Modify Call::Transfer to Transfer(Transaction, Signature)
+- Use Codec to get back struct Transaction
+- fn verify<M: AsRef<[u8]>>(
+  sig: &Self::Signature,
+  message: M,
+  pubkey: &Self::Public
+  ) -> bool
+- if verify is true then validate amount balance & execute
+
+

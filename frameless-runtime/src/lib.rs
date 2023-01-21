@@ -110,11 +110,18 @@ pub type BlockNumber = u32;
 pub type Header = sp_runtime::generic::Header<BlockNumber, BlakeTwo256>;
 pub type Block = sp_runtime::generic::Block<Header, BasicExtrinsic>;
 
+
+pub struct Account([u8; 32]);
+pub type Address = [u8; 32];
+pub type Amount = u128;
+
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize, parity_util_mem::MallocSizeOf))]
 #[derive(Encode, Decode, Debug, PartialEq, Eq, Clone)]
 pub enum Call {
 	SetValue(u32),
-	Transfer([u8; 32], [u8; 32], u128),
+	Transfer(Address, Address, Amount),
+	Mint(Address, Amount),
+	Burn(Address),
 	Upgrade(Vec<u8>),
 }
 
@@ -153,7 +160,7 @@ const BLOCK_TIME: u64 = 3000;
 const HEADER_KEY: &[u8] = b"header"; // 686561646572
 const EXTRINSIC_KEY: &[u8] = b"extrinsics";
 const VALUE_KEY: &[u8] = b"VALUE_KEY";
-
+const BURN_ADDRESS: [u8; 32] = [0u8; 32];
 
 // just FYI:
 // :code => 3a636f6465
@@ -189,7 +196,7 @@ impl Runtime {
 	}
 
 	fn dispatch_extrinsic(ext: BasicExtrinsic) -> DispatchResult {
-		log::debug!(target: LOG_TARGET, "dispatching {:?}", ext);
+		log::debug!(target: LOG_TARGET, "I am dispatching {:?}", ext);
 
 		Self::mutate_state::<Vec<Vec<u8>>>(EXTRINSIC_KEY, |s| s.push(ext.encode()));
 
@@ -198,13 +205,44 @@ impl Runtime {
 			Call::SetValue(v) => {
 				sp_io::storage::set(VALUE_KEY, &v.encode());
 			},
-			Call::Transfer(_, _, _) => {},
+			Call::Transfer(from, to, amount) => {
+				// Fetch Balances
+				let origin_balance = Self::get_state::<Amount>(&from).unwrap_or(0);
+				let target_balance = Self::get_state::<Amount>(&to).unwrap_or(0);
+
+				// Validate & Set Balances
+				if origin_balance > amount {
+					let new_origin_balance = origin_balance - amount;
+					info!(target: LOG_TARGET,"✅SETTING ORIGIN BALANCE FROM {:?} TO {:?} .... ", origin_balance, new_origin_balance);
+					sp_io::storage::set(&from, &new_origin_balance.encode());
+					let new_target_balance = target_balance + amount;
+					info!(target: LOG_TARGET,"✅SETTING TARGET BALANCE FROM {:?} TO {:?} .... ", target_balance, new_target_balance);
+					sp_io::storage::set(&to, &new_target_balance.encode());
+				} else{
+					info!(target: LOG_TARGET,"❌ ORIGIN BALANCE DOESNT HAVE ENOUGH AMOUNT TO SEND {:?} .... ", amount);
+				}
+			},
 			Call::Upgrade(new_wasm_code) => {
 				// NOTE: make sure to upgrade your spec-version!
-				sp_io::storage::set(well_known_keys::CODE, &new_wasm_code);
+				sp_io::storage::set(sp_storage::well_known_keys::CODE, &new_wasm_code);
+			},
+
+			Call::Mint(account_address, balance) => {
+
+				let current_account_balance = Self::get_state::<Amount>(&account_address).unwrap_or(0);
+				if current_account_balance > 0 {
+					let new_contract_balance = current_account_balance + balance;
+					info!(target: LOG_TARGET,"🚀ADDRESS {:?} NOW HAS {:?} TOKENS  ", account_address,new_contract_balance);
+				}else{
+					info!(target: LOG_TARGET,"ADDRESS {:?} CURRENTLY HAS {:?} TOKENS ", account_address,current_account_balance);
+					sp_io::storage::set(&account_address, &balance.encode());
+				}
+			},
+
+			Call::Burn(address) => {
+				sp_io::storage::set(&address, &0u128.encode());
 			}
 		}
-
 		Ok(())
 	}
 
@@ -445,7 +483,52 @@ mod tests {
 	fn encode_examples() {
 		// run with `cargo test -p frameless-runtime -- --nocapture`
 		let extrinsic = BasicExtrinsic::new_unsigned(Call::SetValue(42));
-		println!("ext {:?}", HexDisplay::from(&extrinsic.encode()));
-		println!("key {:?}", HexDisplay::from(&VALUE_KEY));
+		// println!("ext {:?}", HexDisplay::from(&extrinsic.encode()));
+		// println!("key {:?}", HexDisplay::from(&VALUE_KEY));
+	}
+
+	#[test]
+	fn extrinsic_for_minting() {
+		let mint_address = [1u8; 32];
+		let amount: u128 = 1000;
+		let extrinsic = BasicExtrinsic::new_unsigned(Call::Mint(mint_address, amount));
+		// println!("ext_mint {:?}", HexDisplay::from(&extrinsic.encode()));
+		// println!("key {:?}", HexDisplay::from(&VALUE_KEY));
+	}
+
+	#[test]
+	fn test_account_balance_mint() {
+		let account = [1u8; 32];
+		let balance_to_mint = 2000u128;
+
+		let extrinsic = BasicExtrinsic::new_unsigned(Call::Mint(account,balance_to_mint));
+		sp_io::TestExternalities::new_empty().execute_with(|| {
+			Runtime::do_apply_extrinsic(extrinsic.clone()).unwrap();
+			let account_balance = sp_io::storage::get(&account);
+			println!("Account: {:?} now has balance {:?}", account, account_balance);
+		})
+	}
+
+	#[test]
+	fn test_account_transfers() {
+		let origin_address = [1u8; 32];
+		let origin_balance = 2000u128;
+		let target_address = [2u8; 32];
+		let target_balance = 3000u128;
+
+		let transfer_amount: u128 = 1000;
+
+		let account_mint_extrinsic = BasicExtrinsic::new_unsigned(Call::Mint(origin_address,origin_balance));
+		let transfer_extrinsic = BasicExtrinsic::new_unsigned(Call::Transfer(origin_address, target_address, transfer_amount));
+
+		println!("ext_transfer {:?}", HexDisplay::from(&transfer_extrinsic.encode().clone()));
+		sp_io::TestExternalities::new_empty().execute_with(|| {
+			Runtime::do_apply_extrinsic(account_mint_extrinsic.clone()).unwrap();
+			Runtime::do_apply_extrinsic(transfer_extrinsic.clone()).unwrap();
+			let new_origin_balance: u128 = Runtime::get_state::<u128>(&origin_address).unwrap();
+			println!("origin balance {:?} is now {:?}", origin_balance, new_origin_balance);
+		})
 	}
 }
+
+// RUST_LOG=frameless=debug
