@@ -297,6 +297,7 @@ CLI App (wallet UX)
 [//]: # (- Create recovery phrase and random values for entropy)
 - use sp_core:: and sp_io
 - pub fn from_entropy(entropy: &[u8], password: Option<&str>) -> (Pair, [u8; 32]) PubKey & PrivateKey
+- struct Transaction { from, to, amount }
 - message => Hash(transaction)
 - fn sign(&self, message: &[u8]) -> Self::Signature [https://paritytech.github.io/substrate/master/sp_core/crypto/trait.Pair.html#tymethod.sign]
 - Test encode Transaction into/from bytes using Scale Codec

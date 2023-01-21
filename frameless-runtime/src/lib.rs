@@ -34,6 +34,7 @@ use sp_version::RuntimeVersion;
 
 #[cfg(feature = "std")]
 use serde::{Deserialize, Serialize};
+use sp_core::sr25519::Signature;
 
 /// Opaque types. These are used by the CLI to instantiate machinery that don't need to know
 /// the specifics of the runtime. They can then be made to be agnostic over specific formats
@@ -113,36 +114,47 @@ pub type Block = sp_runtime::generic::Block<Header, BasicExtrinsic>;
 
 pub struct Account([u8; 32]);
 pub type Address = [u8; 32];
-pub type Amount = u128;
+pub type Amount = u32;
 
-#[cfg_attr(feature = "std", derive(Serialize, Deserialize, parity_util_mem::MallocSizeOf))]
+#[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
+#[derive(Encode, Clone, Copy, Decode, PartialEq, Eq, Debug)]
+pub struct Transaction {
+	pub from: Address,
+	pub to: Address,
+	pub send_amount: Amount,
+}
+
+#[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 #[derive(Encode, Decode, Debug, PartialEq, Eq, Clone)]
 pub enum Call {
 	SetValue(u32),
-	Transfer(Address, Address, Amount),
+	Transfer(Transaction),
 	Mint(Address, Amount),
 	Burn(Address),
 	Upgrade(Vec<u8>),
 }
 
 // this extrinsic type does nothing other than fulfill the compiler.
-#[cfg_attr(feature = "std", derive(Serialize, Deserialize, parity_util_mem::MallocSizeOf))]
+#[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 #[derive(Debug, Encode, Decode, PartialEq, Eq, Clone)]
-pub struct BasicExtrinsic(Call);
+pub struct BasicExtrinsic{
+	call: Call,
+	signature: Option<Signature>
+}
 
 #[cfg(test)]
 impl BasicExtrinsic {
-	fn new_unsigned(call: Call) -> Self {
+	pub fn new_unsigned(call: Call) -> Self {
 		<Self as Extrinsic>::new(call, None).unwrap()
 	}
 }
 
 impl sp_runtime::traits::Extrinsic for BasicExtrinsic {
 	type Call = Call;
-	type SignaturePayload = ();
+	type SignaturePayload = Signature;
 
-	fn new(data: Self::Call, _: Option<Self::SignaturePayload>) -> Option<Self> {
-		Some(Self(data))
+	fn new(data: Self::Call, signature: Option<Self::SignaturePayload>) -> Option<Self> {
+		Some(Self{ call: data, signature: signature})
 	}
 }
 
@@ -201,25 +213,26 @@ impl Runtime {
 		Self::mutate_state::<Vec<Vec<u8>>>(EXTRINSIC_KEY, |s| s.push(ext.encode()));
 
 		// execute it
-		match ext.0 {
+		match ext.call {
 			Call::SetValue(v) => {
 				sp_io::storage::set(VALUE_KEY, &v.encode());
 			},
-			Call::Transfer(from, to, amount) => {
+			Call::Transfer(transaction) => {
 				// Fetch Balances
-				let origin_balance = Self::get_state::<Amount>(&from).unwrap_or(0);
-				let target_balance = Self::get_state::<Amount>(&to).unwrap_or(0);
+				let origin_balance = Self::get_state::<Amount>(&transaction.from).unwrap_or(0);
+				let target_balance = Self::get_state::<Amount>(&transaction.to).unwrap_or(0);
 
 				// Validate & Set Balances
-				if origin_balance > amount {
-					let new_origin_balance = origin_balance - amount;
+				if origin_balance > transaction.send_amount {
+					let new_origin_balance = origin_balance - transaction.send_amount;
 					info!(target: LOG_TARGET,"✅SETTING ORIGIN BALANCE FROM {:?} TO {:?} .... ", origin_balance, new_origin_balance);
-					sp_io::storage::set(&from, &new_origin_balance.encode());
-					let new_target_balance = target_balance + amount;
+					sp_io::storage::set(&transaction.from, &new_origin_balance.encode());
+					let new_target_balance = target_balance + transaction.send_amount;
 					info!(target: LOG_TARGET,"✅SETTING TARGET BALANCE FROM {:?} TO {:?} .... ", target_balance, new_target_balance);
-					sp_io::storage::set(&to, &new_target_balance.encode());
+					sp_io::storage::set(&transaction.to, &new_target_balance.encode());
 				} else{
-					info!(target: LOG_TARGET,"❌ ORIGIN BALANCE DOESNT HAVE ENOUGH AMOUNT TO SEND {:?} .... ", amount);
+					info!(target: LOG_TARGET,"❌ ORIGIN BALANCE DOESNT HAVE ENOUGH AMOUNT TO SEND {:?} .... ", transaction.send_amount);
+					return Err(());
 				}
 			},
 			Call::Upgrade(new_wasm_code) => {
@@ -321,7 +334,7 @@ impl Runtime {
 
 		// we don't know how to validate this -- It should be fine??
 
-		let data = tx.0;
+		let data = tx.call;
 		Ok(ValidTransaction { provides: vec![data.encode()], ..Default::default() })
 	}
 
@@ -497,11 +510,11 @@ mod tests {
 	}
 
 	#[test]
-	fn test_account_balance_mint() {
+	fn mint_initial_balance_on_account() {
 		let account = [1u8; 32];
-		let balance_to_mint = 2000u128;
+		let balance = 2000u128;
 
-		let extrinsic = BasicExtrinsic::new_unsigned(Call::Mint(account,balance_to_mint));
+		let extrinsic = BasicExtrinsic::new_unsigned(Call::Mint(account, balance));
 		sp_io::TestExternalities::new_empty().execute_with(|| {
 			Runtime::do_apply_extrinsic(extrinsic.clone()).unwrap();
 			let account_balance = sp_io::storage::get(&account);
@@ -510,25 +523,39 @@ mod tests {
 	}
 
 	#[test]
-	fn test_account_transfers() {
-		let origin_address = [1u8; 32];
-		let origin_balance = 2000u128;
-		let target_address = [2u8; 32];
-		let target_balance = 3000u128;
+	fn err_from_account_transfer_with_insufficient_balance() {
+		let starting_balance = 2000u128;
 
-		let transfer_amount: u128 = 1000;
+		let transaction = Transaction {
+			from: [1u8; 32],
+			to: [2u8; 32],
+			send_amount: 5000 //sending more than account balance => Err()
+		};
 
-		let account_mint_extrinsic = BasicExtrinsic::new_unsigned(Call::Mint(origin_address,origin_balance));
-		let transfer_extrinsic = BasicExtrinsic::new_unsigned(Call::Transfer(origin_address, target_address, transfer_amount));
+		let account_mint_extrinsic = BasicExtrinsic::new_unsigned(Call::Mint(transaction.from, starting_balance));
+
+		// TODO: test with signed extrinsic
+		let transfer_extrinsic = BasicExtrinsic::new_unsigned(Call::Transfer(transaction));
 
 		println!("ext_transfer {:?}", HexDisplay::from(&transfer_extrinsic.encode().clone()));
 		sp_io::TestExternalities::new_empty().execute_with(|| {
 			Runtime::do_apply_extrinsic(account_mint_extrinsic.clone()).unwrap();
-			Runtime::do_apply_extrinsic(transfer_extrinsic.clone()).unwrap();
-			let new_origin_balance: u128 = Runtime::get_state::<u128>(&origin_address).unwrap();
-			println!("origin balance {:?} is now {:?}", origin_balance, new_origin_balance);
+			Runtime::do_apply_extrinsic(transfer_extrinsic.clone()).expect_err("Insufficient Origin Account Balance");
+			let end_balance: u128 = Runtime::get_state::<u128>(&transaction.from).unwrap();
+
+			assert_eq!(starting_balance, end_balance);
+			println!("starting_balance {:?} == {:?}", end_balance, end_balance);
 		})
 	}
+
+	//TODO:
+	#[test]
+	fn test_transfer_with_unsigned_extrinsic() {}
+
+	//TODO:
+	#[test]
+	fn test_insuffiencient_transfer_with_signed_extrinsic() {}
+
 }
 
 // RUST_LOG=frameless=debug
