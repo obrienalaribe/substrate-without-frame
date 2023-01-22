@@ -283,7 +283,9 @@ wscat -c 127.0.0.1:9944 -x '{"jsonrpc":"2.0", "id":1, "method":"author_submitExt
 
 # You can easily achieve the same with `curl` as well:
 
-curl http://localhost:9933 -H "Content-Type:application/json;charset=utf-8" -d   '{"jsonrpc":"2.0","id":1,"method":"author_submitExtrinsic", "params": ["002a000000"] }'
+curl http://localhost:9933 -H "Content-Type:application/json" -d   '{"jsonrpc":"2.0","id":1,"method":"author_submitExtrinsic", "params": ["002a000000"] }'
+curl http://localhost:9933 -H "Content-Type:application/json" -d   '{"jsonrpc":"2.0","id":1,"method":"state_getStorage", "params": ["12b4010287c6c8dbac31492b2e8de05fb48a2fcc0a7b7bcfe9ea59d11a5b6474"] }'
+
 ```
 
 The easiest way to get the encoded keys is to write a unit test in your runtime that encodes a key/extrinsic.

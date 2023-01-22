@@ -809,12 +809,13 @@ name = "frontend"
 version = "0.1.0"
 dependencies = [
  "frameless-runtime",
+ "hex",
  "parity-scale-codec",
  "reqwest",
  "serde",
  "serde_json",
  "sp-application-crypto 13.0.0",
- "sp-core 12.0.0",
+ "sp-core 7.0.0",
  "sp-runtime 14.0.0",
  "tokio",
 ]

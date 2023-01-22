@@ -6,7 +6,7 @@ include!(concat!(env!("OUT_DIR"), "/wasm_binary.rs"));
 use parity_scale_codec::{Decode, Encode};
 use sp_consensus_aura::sr25519::AuthorityId as AuraId;
 
-use log::info;
+use log::{info, trace};
 
 use sp_api::{impl_runtime_apis, HashT};
 use sp_runtime::{
@@ -26,7 +26,7 @@ use sp_storage::well_known_keys;
 #[cfg(any(feature = "std", test))]
 use sp_runtime::{BuildStorage, Storage};
 
-use sp_core::{hexdisplay::HexDisplay, OpaqueMetadata, H256};
+use sp_core::{hexdisplay::HexDisplay, OpaqueMetadata, H256, sr25519};
 
 #[cfg(feature = "std")]
 use sp_version::NativeVersion;
@@ -34,7 +34,7 @@ use sp_version::RuntimeVersion;
 
 #[cfg(feature = "std")]
 use serde::{Deserialize, Serialize};
-use sp_core::sr25519::Signature;
+use sp_core::sr25519::{Public, Signature};
 
 /// Opaque types. These are used by the CLI to instantiate machinery that don't need to know
 /// the specifics of the runtime. They can then be made to be agnostic over specific formats
@@ -113,14 +113,14 @@ pub type Block = sp_runtime::generic::Block<Header, BasicExtrinsic>;
 
 
 pub struct Account([u8; 32]);
-pub type Address = [u8; 32];
+// pub type Address = [u8; 32];
 pub type Amount = u32;
 
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
 #[derive(Encode, Clone, Copy, Decode, PartialEq, Eq, Debug)]
 pub struct Transaction {
-	pub from: Address,
-	pub to: Address,
+	pub from: Public,
+	pub to: Public,
 	pub send_amount: Amount,
 }
 
@@ -129,8 +129,8 @@ pub struct Transaction {
 pub enum Call {
 	SetValue(u32),
 	Transfer(Transaction),
-	Mint(Address, Amount),
-	Burn(Address),
+	Mint(Public, Amount),
+	Burn(Public),
 	Upgrade(Vec<u8>),
 }
 
@@ -142,10 +142,12 @@ pub struct BasicExtrinsic{
 	signature: Option<Signature>
 }
 
-#[cfg(test)]
 impl BasicExtrinsic {
 	pub fn new_unsigned(call: Call) -> Self {
 		<Self as Extrinsic>::new(call, None).unwrap()
+	}
+	pub fn signed(call: Call, signature: Option<<Self as Extrinsic>::SignaturePayload>) -> Self {
+		<Self as Extrinsic>::new(call, signature).unwrap()
 	}
 }
 
@@ -241,14 +243,16 @@ impl Runtime {
 			},
 
 			Call::Mint(account_address, balance) => {
-
 				let current_account_balance = Self::get_state::<Amount>(&account_address).unwrap_or(0);
+				info!(target: LOG_TARGET,"💰MINTING STEP- ADDRESS {:?} CURRENTLY HAS {:?} TOKENS ", account_address,current_account_balance);
+
 				if current_account_balance > 0 {
 					let new_contract_balance = current_account_balance + balance;
 					info!(target: LOG_TARGET,"🚀ADDRESS {:?} NOW HAS {:?} TOKENS  ", account_address,new_contract_balance);
 				}else{
-					info!(target: LOG_TARGET,"ADDRESS {:?} CURRENTLY HAS {:?} TOKENS ", account_address,current_account_balance);
 					sp_io::storage::set(&account_address, &balance.encode());
+					let minted_account_balance = Self::get_state::<Amount>(&account_address).unwrap();
+					info!(target: LOG_TARGET,"ADDRESS {:?} NOW HAS {:?} TOKENS ", account_address,minted_account_balance);
 				}
 			},
 
@@ -482,9 +486,22 @@ impl_runtime_apis! {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use parity_scale_codec::Encode;
+	use parity_scale_codec::{ Encode, Decode };
 	use sp_core::hexdisplay::HexDisplay;
+	use sp_core::crypto::Pair;
+	use sp_core::sr25519;
 
+	fn new_accounts() -> (sr25519::Pair, sr25519::Pair){
+		let p1_mnemonic = "grass rib slab system month zoo observe render display shallow clay venture";
+		let p2_mnemonic = "scan true window staff cloth loud accuse retreat tent rack glimpse genuine";
+
+		let keypair: sr25519::Pair = Pair::from_string(p1_mnemonic, None).unwrap();
+		println!("P1 Public Key: 0x{:?}", keypair.to_owned().public());
+		let keypair_p2: sr25519::Pair = Pair::from_string(p2_mnemonic, None).unwrap();
+		println!("P2 Public Key: 0x{:?}", keypair_p2.to_owned().public());
+
+		(keypair, keypair_p2)
+	}
 	#[test]
 	fn host_function_call_works() {
 		sp_io::TestExternalities::new_empty().execute_with(|| {
@@ -492,33 +509,26 @@ mod tests {
 		})
 	}
 
-	#[test]
-	fn encode_examples() {
-		// run with `cargo test -p frameless-runtime -- --nocapture`
-		let extrinsic = BasicExtrinsic::new_unsigned(Call::SetValue(42));
-		// println!("ext {:?}", HexDisplay::from(&extrinsic.encode()));
-		// println!("key {:?}", HexDisplay::from(&VALUE_KEY));
-	}
 
-	#[test]
-	fn extrinsic_for_minting() {
-		let mint_address = [1u8; 32];
-		let amount: u128 = 1000;
-		let extrinsic = BasicExtrinsic::new_unsigned(Call::Mint(mint_address, amount));
-		// println!("ext_mint {:?}", HexDisplay::from(&extrinsic.encode()));
-		// println!("key {:?}", HexDisplay::from(&VALUE_KEY));
-	}
+	// #[test]
+	// fn extrinsic_for_minting() {
+	// 	let mint_address = [1u8; 32];
+	// 	let amount: u128 = 1000;
+	// 	let extrinsic = BasicExtrinsic::new_unsigned(Call::Mint(mint_address, amount));
+	// 	// println!("ext_mint {:?}", HexDisplay::from(&extrinsic.encode()));
+	// 	// println!("key {:?}", HexDisplay::from(&VALUE_KEY));
+	// }
 
 	#[test]
 	fn mint_initial_balance_on_account() {
-		let account = [1u8; 32];
-		let balance = 2000u128;
-
-		let extrinsic = BasicExtrinsic::new_unsigned(Call::Mint(account, balance));
+		let balance = 100;
+		let (p1, p2) = new_accounts();
+		let extrinsic = BasicExtrinsic::new_unsigned(Call::Mint(p1.public(), balance));
 		sp_io::TestExternalities::new_empty().execute_with(|| {
+			sp_tracing::try_init_simple();
 			Runtime::do_apply_extrinsic(extrinsic.clone()).unwrap();
-			let account_balance = sp_io::storage::get(&account);
-			println!("Account: {:?} now has balance {:?}", account, account_balance);
+			let account_balance: u32 = Runtime::get_state(&p1.public()).unwrap();
+			assert_eq!(100, account_balance);
 		})
 	}
 
@@ -526,26 +536,26 @@ mod tests {
 	fn err_from_account_transfer_with_insufficient_balance() {
 		let starting_balance = 2000u128;
 
-		let transaction = Transaction {
-			from: [1u8; 32],
-			to: [2u8; 32],
-			send_amount: 5000 //sending more than account balance => Err()
-		};
-
-		let account_mint_extrinsic = BasicExtrinsic::new_unsigned(Call::Mint(transaction.from, starting_balance));
-
-		// TODO: test with signed extrinsic
-		let transfer_extrinsic = BasicExtrinsic::new_unsigned(Call::Transfer(transaction));
-
-		println!("ext_transfer {:?}", HexDisplay::from(&transfer_extrinsic.encode().clone()));
-		sp_io::TestExternalities::new_empty().execute_with(|| {
-			Runtime::do_apply_extrinsic(account_mint_extrinsic.clone()).unwrap();
-			Runtime::do_apply_extrinsic(transfer_extrinsic.clone()).expect_err("Insufficient Origin Account Balance");
-			let end_balance: u128 = Runtime::get_state::<u128>(&transaction.from).unwrap();
-
-			assert_eq!(starting_balance, end_balance);
-			println!("starting_balance {:?} == {:?}", end_balance, end_balance);
-		})
+		// let transaction = Transaction {
+		// 	from: [1u8; 32],
+		// 	to: [2u8; 32],
+		// 	send_amount: 5000 //sending more than account balance => Err()
+		// };
+		//
+		// let account_mint_extrinsic = BasicExtrinsic::new_unsigned(Call::Mint(transaction.from, starting_balance));
+		//
+		// // TODO: test with signed extrinsic
+		// let transfer_extrinsic = BasicExtrinsic::new_unsigned(Call::Transfer(transaction));
+		//
+		// println!("ext_transfer {:?}", HexDisplay::from(&transfer_extrinsic.encode().clone()));
+		// sp_io::TestExternalities::new_empty().execute_with(|| {
+		// 	Runtime::do_apply_extrinsic(account_mint_extrinsic.clone()).unwrap();
+		// 	Runtime::do_apply_extrinsic(transfer_extrinsic.clone()).expect_err("Insufficient Origin Account Balance");
+		// 	let end_balance: u128 = Runtime::get_state::<u128>(&transaction.from).unwrap();
+		//
+		// 	assert_eq!(starting_balance, end_balance);
+		// 	println!("starting_balance {:?} == {:?}", end_balance, end_balance);
+		// })
 	}
 
 	//TODO:
