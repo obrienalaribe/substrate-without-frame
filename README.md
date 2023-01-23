@@ -119,3 +119,8 @@ let signature = keypair.sign(&message_hash);
        allow transfer
     }
 ```
+
+#### Test cases
+```rust
+ RUST_LOG=frameless=debug cargo test -- --nocapture
+```
