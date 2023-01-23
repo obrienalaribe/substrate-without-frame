@@ -74,7 +74,7 @@ async fn get_state_request(public_key: Public) -> u32 {
 	balance
 }
 
-fn take_input() -> (String, String) {
+fn take_input() -> (String, u32) {
 	let mut input = String::new();
 	println!("Please Enter: [toAddress Amount]");
 
@@ -87,29 +87,49 @@ fn take_input() -> (String, String) {
 	let payload: Vec<&str> = input.split(" ").collect();
 
 	if payload.len() == 2 {
-		println!("{} {}", payload[0], payload[1]);
-		return (payload[0].to_string(), payload[1].to_string())
+		let amount: u32 = payload[1].parse().unwrap();
+		return (payload[0].to_string(), amount)
 	}else{
 		process::exit(1);
 	}
+}
 
+fn fees(transaction: Transaction) -> Transaction {
+	let mut transaction = transaction.clone();
+	let mut input = String::new();
+	println!("Enter Fee: [Amount]");
+
+	io::stdin()
+		.read_line(&mut input)
+		.expect("Failed to read line");
+
+	let fee: u32 = input.trim().parse().expect("Fee needs to be a u32");
+	transaction.fee = fee;
+	transaction.send_amount = transaction.send_amount;
+	return transaction;
 }
 
 #[tokio::main]
 async fn main(){
-	// Generate 2 accounts from seed
 	let p1_mnemonic = "grass rib slab system month zoo observe render display shallow clay venture";
 	let p2_mnemonic = "scan true window staff cloth loud accuse retreat tent rack glimpse genuine";
 
 	let keypair = sr25519::Pair::from_string(p1_mnemonic, None).unwrap();
-	println!("Your Public Key: {}", keypair.to_owned().public());
+	let mint_keypair_ext: BasicExtrinsic = BasicExtrinsic::new_unsigned(Call::Mint(keypair.public(), 0));
+	send_extrinsic(mint_keypair_ext).await;
+	println!("");
+	println!("################################");
+	println!("Your Account: {}", keypair.to_owned().public());
+
 	let keypair_p2 = sr25519::Pair::from_string(p2_mnemonic, None).unwrap();
-	println!("John's Public Key: {}", keypair_p2.to_owned().public());
+	let mint_keypair2_ext: BasicExtrinsic = BasicExtrinsic::new_unsigned(Call::Mint(keypair_p2.public(), 0));
+	send_extrinsic(mint_keypair2_ext).await;
+	println!("John's Account: {}", keypair_p2.to_owned().public());
+	println!("################################");
 
 	let mut address_map: HashMap<String, Public> = HashMap::new();
 	address_map.insert(format!("{}", keypair.to_owned().public()), keypair.public());
 	address_map.insert(format!("{}", keypair_p2.to_owned().public()), keypair_p2.public());
-	println!("Map{:?}", address_map);
 
 	loop {
 		println!("Please input an action: [mint, transfer, balance]");
@@ -123,10 +143,10 @@ async fn main(){
 		let command: String = action.trim().parse().expect("Please type an action!");
 
 		match command.as_str() {
-			c if c.contains("mint") => {
+			c if c.to_lowercase().contains("mint") => {
 				let (address, amount) = take_input();
 				let public_key:&Public  = address_map.get(&address).unwrap();
-				let mint_extrinsic: BasicExtrinsic = BasicExtrinsic::new_unsigned(Call::Mint(*public_key, 100));
+				let mint_extrinsic: BasicExtrinsic = BasicExtrinsic::new_unsigned(Call::Mint(*public_key, amount));
 				send_extrinsic(mint_extrinsic).await;
 				println!("Minted {:?} to {:?}",amount, address );
 			},
@@ -135,21 +155,22 @@ async fn main(){
 				let user_pub_key: Public  = *address_map.get(&format!("{}", keypair.to_owned().public())).unwrap();
 				let recipient_pub_key: Public  = *address_map.get(&address).unwrap();
 
-				let transaction = Transaction {
+				let raw_transaction = Transaction {
 					from: user_pub_key,
 					to: recipient_pub_key,
-					send_amount: 5
+					send_amount: amount,
+					fee: 0
 				};
+
+				println!("Raw Transaction {:?}", raw_transaction);
+
+				let transaction = fees(raw_transaction);
 
 				let message_hash = blake2_256(&*transaction.clone().encode());
 				let signature = keypair.sign(&message_hash);
 
-				// let verify_signature = sr25519::Pair::verify(&signature, message_hash, &keypair.public());
-				// println!("Signature Verification Result: {:?}", verify_signature);
-
 				let transfer_extrinsic: BasicExtrinsic = BasicExtrinsic::signed(Call::Transfer(transaction), Some(signature));
 				let response = send_extrinsic(transfer_extrinsic).await;
-				println!("{:?}", response);
 
 			},
 			c if c.to_lowercase().contains("balance") => {

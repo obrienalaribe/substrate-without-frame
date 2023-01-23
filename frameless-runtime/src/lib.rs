@@ -6,7 +6,7 @@ include!(concat!(env!("OUT_DIR"), "/wasm_binary.rs"));
 use parity_scale_codec::{Decode, Encode};
 use sp_consensus_aura::sr25519::AuthorityId as AuraId;
 
-use log::{info, trace};
+use log::{debug, info, trace};
 
 use sp_api::{impl_runtime_apis, HashT};
 use sp_runtime::{
@@ -27,6 +27,7 @@ use sp_storage::well_known_keys;
 use sp_runtime::{BuildStorage, Storage};
 
 use sp_core::{hexdisplay::HexDisplay, OpaqueMetadata, H256, sr25519};
+use sp_io::hashing::blake2_256;
 
 #[cfg(feature = "std")]
 use sp_version::NativeVersion;
@@ -35,6 +36,9 @@ use sp_version::RuntimeVersion;
 #[cfg(feature = "std")]
 use serde::{Deserialize, Serialize};
 use sp_core::sr25519::{Public, Signature};
+
+use sp_io::crypto::sr25519_verify;
+use crate::Call::Transfer;
 
 /// Opaque types. These are used by the CLI to instantiate machinery that don't need to know
 /// the specifics of the runtime. They can then be made to be agnostic over specific formats
@@ -122,6 +126,7 @@ pub struct Transaction {
 	pub from: Public,
 	pub to: Public,
 	pub send_amount: Amount,
+	pub fee: Amount
 }
 
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
@@ -130,7 +135,6 @@ pub enum Call {
 	SetValue(u32),
 	Transfer(Transaction),
 	Mint(Public, Amount),
-	Burn(Public),
 	Upgrade(Vec<u8>),
 }
 
@@ -174,7 +178,7 @@ const BLOCK_TIME: u64 = 3000;
 const HEADER_KEY: &[u8] = b"header"; // 686561646572
 const EXTRINSIC_KEY: &[u8] = b"extrinsics";
 const VALUE_KEY: &[u8] = b"VALUE_KEY";
-const BURN_ADDRESS: [u8; 32] = [0u8; 32];
+const BLOCK_REWARD: u32 = 10;
 
 // just FYI:
 // :code => 3a636f6465
@@ -224,40 +228,55 @@ impl Runtime {
 				let origin_balance = Self::get_state::<Amount>(&transaction.from).unwrap_or(0);
 				let target_balance = Self::get_state::<Amount>(&transaction.to).unwrap_or(0);
 
-				// Validate & Set Balances
-				if origin_balance > transaction.send_amount {
-					let new_origin_balance = origin_balance - transaction.send_amount;
+				let message_hash = blake2_256(&transaction.clone().encode());
+
+				// Transfer Extrinsic needs a Signature
+				if ext.signature == None {
+					info!(target: LOG_TARGET,"👍❌NO SIGNATURE PROVIDED, DROPPING EXTRINSIC .... ");
+					return Err::<(), ()>(());
+				}
+
+				// Extrinsic Signature is invalid => Not signed by sender
+				if !sr25519_verify(&ext.signature.unwrap(), &message_hash, &transaction.from) {
+					info!(target: LOG_TARGET,"👍❌INVALID SIGNATURE PROVIDED, DROPPING EXTRINSIC .... ");
+					return Err::<(), ()>(());
+				}
+
+				info!(target: LOG_TARGET,"👍✅SIGNATURE STATUS .... ");
+
+				// Validate Funds Transferred then Set State
+				if origin_balance >= (transaction.send_amount + transaction.fee) {
+					let new_origin_balance = origin_balance - (transaction.send_amount + transaction.fee);
 					info!(target: LOG_TARGET,"✅SETTING ORIGIN BALANCE FROM {:?} TO {:?} .... ", origin_balance, new_origin_balance);
 					sp_io::storage::set(&transaction.from, &new_origin_balance.encode());
 					let new_target_balance = target_balance + transaction.send_amount;
 					info!(target: LOG_TARGET,"✅SETTING TARGET BALANCE FROM {:?} TO {:?} .... ", target_balance, new_target_balance);
 					sp_io::storage::set(&transaction.to, &new_target_balance.encode());
 				} else{
-					info!(target: LOG_TARGET,"❌ ORIGIN BALANCE DOESNT HAVE ENOUGH AMOUNT TO SEND {:?} .... ", transaction.send_amount);
+					info!(target: LOG_TARGET,"❌ ORIGIN BALANCE DOESNT HAVE ENOUGH AMOUNT TO SEND {:?} WITH FEE AMOUNT {:?} .... ", transaction.send_amount, transaction.fee);
 					return Err(());
 				}
+
+
+
 			},
 			Call::Upgrade(new_wasm_code) => {
 				// NOTE: make sure to upgrade your spec-version!
 				sp_io::storage::set(sp_storage::well_known_keys::CODE, &new_wasm_code);
 			},
 
-			Call::Mint(account_address, balance) => {
+			Call::Mint(account_address, amount) => {
 				let current_account_balance = Self::get_state::<Amount>(&account_address).unwrap_or(0);
-				info!(target: LOG_TARGET,"💰MINTING STEP- ADDRESS {:?} CURRENTLY HAS {:?} TOKENS ", account_address,current_account_balance);
 
 				if current_account_balance > 0 {
-					let new_contract_balance = current_account_balance + balance;
-					info!(target: LOG_TARGET,"🚀ADDRESS {:?} NOW HAS {:?} TOKENS  ", account_address,new_contract_balance);
-				}else{
-					sp_io::storage::set(&account_address, &balance.encode());
-					let minted_account_balance = Self::get_state::<Amount>(&account_address).unwrap();
-					info!(target: LOG_TARGET,"ADDRESS {:?} NOW HAS {:?} TOKENS ", account_address,minted_account_balance);
+					let new_contract_balance = current_account_balance + amount;
+					sp_io::storage::set(&account_address, &new_contract_balance.encode());
+					info!(target: LOG_TARGET,"🚀ADDRESS {:?} TOKENS INCREMENTED FROM {:?} TO {:?} TOKENS  ", account_address, current_account_balance, new_contract_balance);
+				} else{
+					// initialize mint amount
+					sp_io::storage::set(&account_address, &amount.encode());
+					info!(target: LOG_TARGET,"💰MINTING STEP- ADDRESS {:?} INITIALIZED WITH {:?} TOKENS ", account_address,amount);
 				}
-			},
-
-			Call::Burn(address) => {
-				sp_io::storage::set(&address, &0u128.encode());
 			}
 		}
 		Ok(())
@@ -269,6 +288,14 @@ impl Runtime {
 			"Entering initialize_block. header: {:?} / version: {:?}", header, VERSION.spec_version
 		);
 		sp_io::storage::set(&HEADER_KEY, &header.encode());
+
+		// BLOCK_REWARDs for Alice (Could not get to work on finalize block)
+		let alice_pubkey: Public = Public::from_raw(hex_literal::hex!("d43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a56da27d"));
+		let author_balance = Self::get_state::<Amount>(&alice_pubkey).unwrap_or(0);
+		info!(target: LOG_TARGET, "🤑ALICE BALANCE: {:?}", author_balance);
+		let new_reward = author_balance + BLOCK_REWARD;
+		sp_io::storage::set(&alice_pubkey, &new_reward.encode());
+		info!(target: LOG_TARGET, "🤑REWARDING ALICE for AUTHORING BLOCK, ALICE TOTAL REWARDS: {:?}", new_reward);
 	}
 
 	fn do_finalize_block() -> <Block as BlockT>::Header {
@@ -290,6 +317,7 @@ impl Runtime {
 
 		info!(target: LOG_TARGET, "finalizing block {:?}", header);
 		header
+
 	}
 
 	fn do_execute_block(block: Block) {
@@ -328,7 +356,7 @@ impl Runtime {
 		tx: <Block as BlockT>::Extrinsic,
 		block_hash: <Block as BlockT>::Hash,
 	) -> TransactionValidity {
-		log::debug!(
+		log::info!(
 			target: LOG_TARGET,
 			"Entering validate_transaction. source: {:?}, tx: {:?}, block hash: {:?}",
 			source,
@@ -336,9 +364,8 @@ impl Runtime {
 			block_hash
 		);
 
-		// we don't know how to validate this -- It should be fine??
-
 		let data = tx.call;
+
 		Ok(ValidTransaction { provides: vec![data.encode()], ..Default::default() })
 	}
 
@@ -489,83 +516,225 @@ mod tests {
 	use parity_scale_codec::{ Encode, Decode };
 	use sp_core::hexdisplay::HexDisplay;
 	use sp_core::crypto::Pair;
-	use sp_core::sr25519;
+	use sp_core::{blake2_256, sr25519};
 
 	fn new_accounts() -> (sr25519::Pair, sr25519::Pair){
 		let p1_mnemonic = "grass rib slab system month zoo observe render display shallow clay venture";
 		let p2_mnemonic = "scan true window staff cloth loud accuse retreat tent rack glimpse genuine";
 
 		let keypair: sr25519::Pair = Pair::from_string(p1_mnemonic, None).unwrap();
-		println!("P1 Public Key: 0x{:?}", keypair.to_owned().public());
 		let keypair_p2: sr25519::Pair = Pair::from_string(p2_mnemonic, None).unwrap();
-		println!("P2 Public Key: 0x{:?}", keypair_p2.to_owned().public());
+		// println!("P1 Public Key: 0x{:?}", keypair.to_owned().public());
+		// println!("P2 Public Key: 0x{:?}", keypair_p2.to_owned().public());
 
 		(keypair, keypair_p2)
 	}
-	#[test]
-	fn host_function_call_works() {
-		sp_io::TestExternalities::new_empty().execute_with(|| {
-			sp_io::storage::get(&HEADER_KEY);
-		})
-	}
-
-
-	// #[test]
-	// fn extrinsic_for_minting() {
-	// 	let mint_address = [1u8; 32];
-	// 	let amount: u128 = 1000;
-	// 	let extrinsic = BasicExtrinsic::new_unsigned(Call::Mint(mint_address, amount));
-	// 	// println!("ext_mint {:?}", HexDisplay::from(&extrinsic.encode()));
-	// 	// println!("key {:?}", HexDisplay::from(&VALUE_KEY));
-	// }
 
 	#[test]
-	fn mint_initial_balance_on_account() {
+	fn mint_balance_on_account() {
 		let balance = 100;
 		let (p1, p2) = new_accounts();
 		let extrinsic = BasicExtrinsic::new_unsigned(Call::Mint(p1.public(), balance));
+
+		let mint_more_ext = BasicExtrinsic::new_unsigned(Call::Mint(p1.public(), 100));
+
 		sp_io::TestExternalities::new_empty().execute_with(|| {
-			sp_tracing::try_init_simple();
+			// initial balance on startup is None
+			let initial_balance: Option<u32> = Runtime::get_state(&p1.public());
+			assert_eq!(None, initial_balance);
+
+			// Mint 100 Tokens
 			Runtime::do_apply_extrinsic(extrinsic.clone()).unwrap();
 			let account_balance: u32 = Runtime::get_state(&p1.public()).unwrap();
 			assert_eq!(100, account_balance);
+
+			// Mint 100 more == 200
+			Runtime::do_apply_extrinsic(mint_more_ext.clone()).unwrap();
+			let new_balance: u32 = Runtime::get_state(&p1.public()).unwrap();
+			assert_eq!(200, new_balance);
+		});
+
+
+	}
+
+	#[test]
+	fn test_unsuccessful_transfer_with_no_signature() {
+		let balance = 100;
+		let (p1, p2) = new_accounts();
+		let mint_ext = BasicExtrinsic::new_unsigned(Call::Mint(p1.public(), balance));
+
+		let transaction = Transaction {
+			from: p1.public(),
+			to: p2.public(),
+			send_amount: 10,
+			fee: 0
+		};
+
+		let transfer_extrinsic = BasicExtrinsic::new_unsigned(Call::Transfer(transaction));
+
+		sp_io::TestExternalities::new_empty().execute_with(|| {
+			// sp_tracing::try_init_simple();
+
+			Runtime::do_apply_extrinsic(mint_ext.clone()).unwrap();
+			let result = Runtime::do_apply_extrinsic(transfer_extrinsic.clone()).expect_err("Unsigned transaction");
+			let end_balance: u32 = Runtime::get_state::<u32>(&transaction.from).unwrap();
+
+			// unchanged balance
+			assert_eq!(100, end_balance);
+			assert_eq!(result, TransactionValidityError::Invalid(InvalidTransaction::Custom(0)));
 		})
 	}
 
 	#[test]
-	fn err_from_account_transfer_with_insufficient_balance() {
-		let starting_balance = 2000u128;
+	fn test_unsuccessful_transfer_with_invalid_signature() {
+		let balance = 100;
+		let (p1, p2) = new_accounts();
+		let mint_ext = BasicExtrinsic::new_unsigned(Call::Mint(p1.public(), balance));
 
-		// let transaction = Transaction {
-		// 	from: [1u8; 32],
-		// 	to: [2u8; 32],
-		// 	send_amount: 5000 //sending more than account balance => Err()
-		// };
-		//
-		// let account_mint_extrinsic = BasicExtrinsic::new_unsigned(Call::Mint(transaction.from, starting_balance));
-		//
-		// // TODO: test with signed extrinsic
-		// let transfer_extrinsic = BasicExtrinsic::new_unsigned(Call::Transfer(transaction));
-		//
-		// println!("ext_transfer {:?}", HexDisplay::from(&transfer_extrinsic.encode().clone()));
-		// sp_io::TestExternalities::new_empty().execute_with(|| {
-		// 	Runtime::do_apply_extrinsic(account_mint_extrinsic.clone()).unwrap();
-		// 	Runtime::do_apply_extrinsic(transfer_extrinsic.clone()).expect_err("Insufficient Origin Account Balance");
-		// 	let end_balance: u128 = Runtime::get_state::<u128>(&transaction.from).unwrap();
-		//
-		// 	assert_eq!(starting_balance, end_balance);
-		// 	println!("starting_balance {:?} == {:?}", end_balance, end_balance);
-		// })
+		let transaction = Transaction {
+			from: p1.public(),
+			to: p2.public(),
+			send_amount: 10,
+			fee: 0
+		};
+
+		let message_hash = blake2_256(&*transaction.clone().encode());
+
+		// Signing Here with the recipients pub key instead of sender
+		let signature = p2.sign(&message_hash);
+
+		let transfer_extrinsic = BasicExtrinsic::signed(Call::Transfer(transaction), Some(signature));
+
+		sp_io::TestExternalities::new_empty().execute_with(|| {
+			// sp_tracing::try_init_simple();
+			Runtime::do_apply_extrinsic(mint_ext.clone()).unwrap();
+			let result = Runtime::do_apply_extrinsic(transfer_extrinsic.clone()).expect_err("Invalid Signature");
+			let end_balance: u32 = Runtime::get_state::<u32>(&transaction.from).unwrap();
+
+			// unchanged balance
+			assert_eq!(100, end_balance);
+			assert_eq!(result, TransactionValidityError::Invalid(InvalidTransaction::Custom(0)));
+		})
 	}
 
-	//TODO:
-	#[test]
-	fn test_transfer_with_unsigned_extrinsic() {}
 
-	//TODO:
 	#[test]
-	fn test_insuffiencient_transfer_with_signed_extrinsic() {}
+	fn successful_transfer_with_signed_extrinsic() {
+		let balance = 100;
+		let (p1, p2) = new_accounts();
+		let mint_ext = BasicExtrinsic::new_unsigned(Call::Mint(p1.public(), balance));
+
+		let transaction = Transaction {
+			from: p1.public(),
+			to: p2.public(),
+			send_amount: 10,
+			fee: 0
+		};
+
+		let message_hash = blake2_256(&*transaction.clone().encode());
+		let signature = p1.sign(&message_hash);
+
+		let transfer_extrinsic = BasicExtrinsic::signed(Call::Transfer(transaction), Some(signature));
+
+		sp_io::TestExternalities::new_empty().execute_with(|| {
+			Runtime::do_apply_extrinsic(mint_ext.clone()).unwrap();
+			let result = Runtime::do_apply_extrinsic(transfer_extrinsic.clone()).unwrap();
+			let end_balance: u32 = Runtime::get_state::<u32>(&transaction.from).unwrap();
+
+			// changed balance
+			assert_eq!(90, end_balance);
+			assert_eq!(result, Ok(()));
+		})
+	}
+
+	#[test]
+	fn call_signed_extrinsic_with_not_enough_funds() {
+		let balance = 100;
+		let (p1, p2) = new_accounts();
+		let mint_ext = BasicExtrinsic::new_unsigned(Call::Mint(p1.public(), balance));
+
+		let transaction = Transaction {
+			from: p1.public(),
+			to: p2.public(),
+			send_amount: 101, //sending more than account balance => Err()
+			fee: 0
+		};
+
+		let message_hash = blake2_256(&*transaction.clone().encode());
+		let signature = p1.sign(&message_hash);
+
+		let transfer_extrinsic = BasicExtrinsic::signed(Call::Transfer(transaction), Some(signature));
+
+		sp_io::TestExternalities::new_empty().execute_with(|| {
+			// sp_tracing::try_init_simple();
+			Runtime::do_apply_extrinsic(mint_ext.clone()).unwrap();
+			let result = Runtime::do_apply_extrinsic(transfer_extrinsic.clone()).expect_err("Not enough Tokens to send");
+			let end_balance: u32 = Runtime::get_state::<u32>(&transaction.from).unwrap();
+
+			// unchanged balance
+			assert_eq!(100, end_balance);
+			assert_eq!(result, TransactionValidityError::Invalid(InvalidTransaction::Custom(0)));
+		})
+	}
+
+	#[test]
+	fn call_signed_extrinsic_with_amount_and_fees_higher_than_balance() {
+		let balance = 100;
+		let (p1, p2) = new_accounts();
+		let mint_ext = BasicExtrinsic::new_unsigned(Call::Mint(p1.public(), balance));
+
+		let transaction = Transaction {
+			from: p1.public(),
+			to: p2.public(),
+			send_amount: 100, // Account Balance < Fee + Send Amount
+			fee: 10
+		};
+
+		let message_hash = blake2_256(&*transaction.clone().encode());
+		let signature = p1.sign(&message_hash);
+
+		let transfer_extrinsic = BasicExtrinsic::signed(Call::Transfer(transaction), Some(signature));
+
+		sp_io::TestExternalities::new_empty().execute_with(|| {
+			// sp_tracing::try_init_simple();
+			Runtime::do_apply_extrinsic(mint_ext.clone()).unwrap();
+			let result = Runtime::do_apply_extrinsic(transfer_extrinsic.clone()).expect_err("Not enough Tokens to send");
+			let end_balance: u32 = Runtime::get_state::<u32>(&transaction.from).unwrap();
+
+			// unchanged balance
+			assert_eq!(100, end_balance);
+			assert_eq!(result, TransactionValidityError::Invalid(InvalidTransaction::Custom(0)));
+		})
+	}
+
+	#[test]
+	fn call_signed_extrinsic_with_amount_and_fees_less_than_balance() {
+		let balance = 100;
+		let (p1, p2) = new_accounts();
+		let mint_ext = BasicExtrinsic::new_unsigned(Call::Mint(p1.public(), balance));
+
+		let transaction = Transaction {
+			from: p1.public(),
+			to: p2.public(),
+			send_amount: 80,
+			fee: 10
+		};
+
+		let message_hash = blake2_256(&*transaction.clone().encode());
+		let signature = p1.sign(&message_hash);
+
+		let transfer_extrinsic = BasicExtrinsic::signed(Call::Transfer(transaction), Some(signature));
+
+		sp_io::TestExternalities::new_empty().execute_with(|| {
+			// sp_tracing::try_init_simple();
+			Runtime::do_apply_extrinsic(mint_ext.clone()).unwrap();
+			let result = Runtime::do_apply_extrinsic(transfer_extrinsic.clone()).unwrap();
+			let end_balance: u32 = Runtime::get_state::<u32>(&transaction.from).unwrap();
+
+			// unchanged balance
+			assert_eq!(10, end_balance);
+			assert_eq!(Ok(()), result);
+		})
+	}
 
 }
-
-// RUST_LOG=frameless=debug
